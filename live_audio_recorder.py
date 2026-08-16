@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Resilient YouTube Live Audio Recorder
---------------------------------------
+---------------------------------------
 Records a YouTube live stream's audio using yt-dlp, survives network
 interruptions, recovers partial files, and safely converts to MP3.
 
