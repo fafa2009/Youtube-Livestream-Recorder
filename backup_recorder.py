@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Resilient YouTube Live Audio Recorder
----------------------------------------
+--------------------------------------
 Records a YouTube live stream's audio using yt-dlp, survives network
 interruptions, recovers partial files, and safely converts to MP3.
 
@@ -124,10 +124,23 @@ def build_ytdlp_command(url: str, output_template: str, cookies_from_browser: st
     # account for a .part file being present alongside, or instead of, a
     # finished file.
 
+    using_cookies = False
     if cookies_from_browser:
         command += ["--cookies-from-browser", cookies_from_browser]
+        using_cookies = True
     elif cookies_file and os.path.exists(cookies_file):
         command += ["--cookies", cookies_file]
+        using_cookies = True
+
+    if using_cookies:
+        # Known active yt-dlp bug (github.com/yt-dlp/yt-dlp/issues/17389,
+        # open as of Aug 2026): the "tv_downgraded" client — yt-dlp's
+        # default choice when cookies are present — currently fails with
+        # "The page needs to be reloaded." for many users. This is the
+        # workaround yt-dlp's own maintainers point to in that thread:
+        # force a different client pair that doesn't hit the same bug.
+        # Remove this once upstream ships a real fix.
+        command += ["--extractor-args", "youtube:player_client=default,web_embedded"]
 
     return command
 
@@ -248,6 +261,21 @@ def run_recording_supervisor(command: list[str], max_duration: float,
             "This live event has ended",
             "This video is not available",
             "Video unavailable",
+            "The page needs to be reloaded",
+        )
+        # Known-transient filesystem errors: these can happen at ANY point
+        # in a recording, not just at startup, so they must not be judged
+        # by the runtime<15 "network drop" heuristic below. On Windows,
+        # antivirus/search-indexing frequently locks a fragment file for a
+        # moment during rename; yt-dlp gives up after its own internal
+        # retries and exits, but the stream itself is still live and a
+        # fresh yt-dlp process will succeed. Treating this as "stream
+        # ended" (the old behavior) silently truncates the recording.
+        TRANSIENT_FS_MARKERS = (
+            "WinError 32",
+            "being used by another process",
+            "Unable to rename file",
+            "PermissionError",
         )
 
         if any(m in stderr_tail for m in BAD_ARG_MARKERS):
@@ -283,6 +311,24 @@ def run_recording_supervisor(command: list[str], max_duration: float,
         if stderr_tail.strip():
             tail_lines = stderr_tail.strip().splitlines()[-6:]
             logger.warning("yt-dlp stderr (last lines):\n%s", "\n".join(tail_lines))
+
+        if any(m in stderr_tail for m in TRANSIENT_FS_MARKERS):
+            # A file-lock/rename error is transient and can strike well
+            # after the 15s startup window, so it bypasses the runtime
+            # check entirely and always retries (still bounded by
+            # MAX_CONSECUTIVE_RESTARTS as a safety valve).
+            consecutive_restarts += 1
+            logger.warning(
+                "Transient filesystem error after %.1fs runtime (likely AV/"
+                "indexing briefly locking a fragment file on Windows). "
+                "Reconnecting — attempt %d/%d.",
+                runtime, consecutive_restarts, MAX_CONSECUTIVE_RESTARTS,
+            )
+            if consecutive_restarts >= MAX_CONSECUTIVE_RESTARTS:
+                logger.error("Too many consecutive failed restarts. Giving up.")
+                return "gave_up"
+            time.sleep(RESTART_BACKOFF_SECONDS)
+            continue
 
         if runtime < 15:
             consecutive_restarts += 1

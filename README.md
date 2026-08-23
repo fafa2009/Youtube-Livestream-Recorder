@@ -1,5 +1,6 @@
-"# Youtube-Livestream-Recorder"
-A **Python-based tool to record audio from a YouTube Live stream automatically**.
+# Youtube-Livestream-Recorder
+
+**A Python-based tool to record audio from a YouTube Live stream automatically**.
 
 ### 🎯 Goal
 
@@ -45,3 +46,18 @@ A **Python-based tool to record audio from a YouTube Live stream automatically**
 - Windows terminal (important for signal behavior)
 
 ---
+
+## To Convert Manually
+
+ffmpeg -i input.m4a -vn -ab 192k output.mp3
+
+## To Do
+
+- Put into an actual web app
+- Buy data from person?
+- Make it run in a server and have it saved down
+
+## To Scale
+
+- Use that chatgbt prompt. Break it down we should do this one at a time
+- Add video feature also
