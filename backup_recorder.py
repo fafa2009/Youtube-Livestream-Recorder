@@ -44,6 +44,51 @@ STABILITY_REQUIRED_CHECKS = 3      # consecutive unchanged reads = "stable"
 STABILITY_TIMEOUT = 120            # give up waiting for stability after this
 RESTART_BACKOFF_SECONDS = 5        # wait before restarting yt-dlp after a crash
 MAX_CONSECUTIVE_RESTARTS = 10      # safety valve against restart storms
+STALL_CHECK_INTERVAL = 5           # seconds between output-file-growth checks
+DEFAULT_STALL_TIMEOUT = 600        # seconds of no file growth before we call it stalled
+
+
+# --------------------------------------------------------------------------
+# Sleep prevention (Windows)
+# --------------------------------------------------------------------------
+# A laptop sleeping mid-recording doesn't just pause yt-dlp — on wake, the
+# underlying HLS connection is dead but yt-dlp doesn't always notice and can
+# sit in an idle "Downloading webpage" loop indefinitely without erroring
+# out or restarting, silently wasting the rest of the recording window.
+# Preventing sleep in the first place is cheaper than detecting the damage
+# afterward, so we do both (see the stall detector further down as backup).
+
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+
+
+def prevent_sleep(logger: logging.Logger) -> None:
+    """Tell Windows not to sleep while we hold this state. No-op on other
+    platforms — sleep behavior there is a separate, OS-specific concern
+    and out of scope for this script."""
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+        logger.info("Sleep prevention enabled (Windows will not sleep while recording).")
+    except Exception as e:
+        logger.warning("Could not enable sleep prevention: %s. The recording "
+                        "may be interrupted if the machine sleeps.", e)
+
+
+def allow_sleep(logger: logging.Logger) -> None:
+    """Release the sleep-prevention hold. Always call this when the
+    recording ends, success or failure, so we don't leave the machine
+    unable to sleep after the script exits."""
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+        logger.debug("Sleep prevention released.")
+    except Exception as e:
+        logger.warning("Could not release sleep prevention: %s", e)
 
 
 def setup_logging(log_dir: Path) -> logging.Logger:
@@ -197,8 +242,9 @@ def send_graceful_stop(process: subprocess.Popen, logger: logging.Logger):
             process.kill()
 
 
-def run_recording_supervisor(command: list[str], max_duration: float,
-                              logger: logging.Logger) -> str:
+def run_recording_supervisor(command: list[str], max_duration: float, logger: logging.Logger,
+                              output_dir: Path, base_filename: str,
+                              stall_timeout: int = DEFAULT_STALL_TIMEOUT) -> str:
     """
     Runs yt-dlp with automatic reconnect.
 
@@ -210,6 +256,13 @@ def run_recording_supervisor(command: list[str], max_duration: float,
     entirely (outside yt-dlp's internal fragment-retry logic). We treat
     a quick, low-effort exit (< 15s runtime) as suspicious and retry;
     a longer run that exits is more likely a legitimate stream end.
+
+    We also watch the OUTPUT FILE ITSELF, not just process liveness.
+    A process surviving a system sleep/wake cycle can end up holding a
+    dead HLS connection and sit in an idle polling loop indefinitely —
+    process.poll() stays None the whole time, so without this check the
+    supervisor is blind to it and just burns the rest of the recording
+    window waiting for a process that will never produce more audio.
     """
     start_time = time.time()
     consecutive_restarts = 0
@@ -224,11 +277,38 @@ def run_recording_supervisor(command: list[str], max_duration: float,
         stderr_path = log_dir / f"ytdlp_stderr_{int(attempt_start)}.log"
         process = start_process(command, logger, stderr_path)
 
+        stalled = False
+        last_growth_size = current_output_size(base_filename, output_dir)
+        last_growth_time = time.time()
+
         try:
             while True:
-                time.sleep(5)
+                time.sleep(STALL_CHECK_INTERVAL)
 
                 if process.poll() is not None:
+                    runtime = time.time() - attempt_start
+                    returncode = process.returncode
+                    break
+
+                size_now = current_output_size(base_filename, output_dir)
+                if size_now > last_growth_size:
+                    last_growth_size = size_now
+                    last_growth_time = time.time()
+                elif time.time() - last_growth_time >= stall_timeout:
+                    # Process is alive (poll() is None) but the output file
+                    # hasn't grown in stall_timeout seconds — classic
+                    # symptom of a dead HLS connection surviving a sleep/
+                    # wake cycle. Force it down and let the outer loop
+                    # start a fresh process with a fresh manifest.
+                    logger.warning(
+                        "No output growth for %ds while process is still "
+                        "running (stuck at %d bytes) — treating as a "
+                        "stalled connection, likely from a sleep/wake cycle "
+                        "or dead network handoff. Forcing restart.",
+                        stall_timeout, size_now,
+                    )
+                    send_graceful_stop(process, logger)
+                    stalled = True
                     runtime = time.time() - attempt_start
                     returncode = process.returncode
                     break
@@ -242,6 +322,22 @@ def run_recording_supervisor(command: list[str], max_duration: float,
             logger.info("Manual stop requested (Ctrl+C).")
             send_graceful_stop(process, logger)
             return "manual_stop"
+
+        if stalled:
+            # A stall is transient by nature (the stream itself is still
+            # live, only this process's connection died) — always retry
+            # regardless of how long the process had been running, the
+            # same principle as the filesystem-lock case below.
+            consecutive_restarts += 1
+            logger.warning(
+                "Restarting after stall detection — attempt %d/%d.",
+                consecutive_restarts, MAX_CONSECUTIVE_RESTARTS,
+            )
+            if consecutive_restarts >= MAX_CONSECUTIVE_RESTARTS:
+                logger.error("Too many consecutive failed restarts. Giving up.")
+                return "gave_up"
+            time.sleep(RESTART_BACKOFF_SECONDS)
+            continue
 
         if returncode == 0:
             logger.info("yt-dlp exited cleanly (stream ended or fully captured).")
@@ -365,6 +461,21 @@ def find_output_files(base_filename: str, directory: Path) -> list[Path]:
         if f.suffix in AUDIO_EXTENSIONS or f.name.endswith(".part"):
             matches.append(f)
     return matches
+
+
+def current_output_size(base_filename: str, directory: Path) -> int:
+    """Largest size among any file matching this recording's name right
+    now (finished file or .part fragment) — used to detect a stalled
+    download while yt-dlp's process is technically still alive.
+    Missing directory or no matches yet both just mean "0 bytes so far",
+    not an error worth raising during an active recording."""
+    try:
+        candidates = find_output_files(base_filename, directory)
+    except OSError:
+        return 0
+    if not candidates:
+        return 0
+    return max(f.stat().st_size for f in candidates if f.exists())
 
 
 def wait_for_file_stability(path: Path, logger: logging.Logger) -> bool:
@@ -516,6 +627,10 @@ def main():
                               r"Use this if yt-dlp reports JS runtimes as unavailable despite "
                               r"node being on PATH (a known PATH-resolution mismatch on some "
                               r"Windows setups).")
+    parser.add_argument("--stall-timeout", type=int, default=DEFAULT_STALL_TIMEOUT,
+                         help="Seconds of no output-file growth before a still-running "
+                              "yt-dlp process is treated as stalled and restarted "
+                              f"(default: {DEFAULT_STALL_TIMEOUT}).")
     args = parser.parse_args()
 
     url = args.url or input("Paste YouTube Live URL: ").strip()
@@ -534,7 +649,15 @@ def main():
                                    args.cookies_file, args.node_path)
 
     logger.info("Recording started. Target duration: %.2f hour(s)", hours)
-    result = run_recording_supervisor(command, hours * 3600, logger)
+    prevent_sleep(logger)
+    try:
+        result = run_recording_supervisor(command, hours * 3600, logger,
+                                           output_dir, base_filename, args.stall_timeout)
+    finally:
+        # Always release the sleep-prevention hold, even if the supervisor
+        # raised — otherwise the machine could be stuck unable to sleep
+        # after the script has already exited.
+        allow_sleep(logger)
     logger.info("Recording phase ended with status: %s", result)
 
     success = finalize_recording(base_filename, output_dir, logger)
