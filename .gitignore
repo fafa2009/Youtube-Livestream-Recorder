@@ -1,1 +1,5 @@
 logs/
+*.part
+*.ytdl
+*_salvaged.m4a
+*.mp3
